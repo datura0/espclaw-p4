@@ -1,4 +1,11 @@
 idf_component_register(
     SRCS
         "main.c"
+    REQUIRES
+        cmd_espnow
+        cmd_wifi
+        espnow_bridge
+        sensor_imu
+        cap_lua
+        esp_new_jpeg
 )

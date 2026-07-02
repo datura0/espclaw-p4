@@ -1,0 +1,54 @@
+menu "ESP-NOW Bridge (S3 via UART)"
+
+    config ESPNOW_BRIDGE_UART_PORT
+        int "UART port number"
+        range 0 2
+        default 1
+        help
+            UART port used to communicate with the external ESP32-S3
+            ESP-NOW bridge. Port 0 is usually reserved for the console.
+
+    config ESPNOW_BRIDGE_UART_BAUD
+        int "UART baud rate"
+        default 921600
+        help
+            Baud rate for the S3 bridge UART. Must match the S3 side.
+
+    config ESPNOW_BRIDGE_UART_TX_PIN
+        int "UART TX pin (P4 → S3 RX)"
+        default 31
+        help
+            GPIO number for P4 TX, connected to S3 RX.
+
+    config ESPNOW_BRIDGE_UART_RX_PIN
+        int "UART RX pin (S3 TX → P4)"
+        default 30
+        help
+            GPIO number for P4 RX, connected to S3 TX.
+
+    config ESPNOW_BRIDGE_UART_RX_BUFFER_SIZE
+        int "RX ring buffer size"
+        default 2048
+        help
+            Size of the UART RX ring buffer in bytes.
+
+    config ESPNOW_BRIDGE_TASK_STACK_SIZE
+        int "RX task stack size"
+        default 3072
+        help
+            Stack size for the bridge RX task.
+
+    config ESPNOW_BRIDGE_TASK_PRIORITY
+        int "RX task priority"
+        range 1 24
+        default 5
+        help
+            FreeRTOS priority for the bridge RX task.
+
+    config ESPNOW_BRIDGE_MAX_FRAME_SIZE
+        int "Max ESP-NOW frame payload size"
+        default 250
+        help
+            Maximum payload size for a single ESP-NOW frame (ESP-NOW limit is 250 bytes).
+
+endmenu

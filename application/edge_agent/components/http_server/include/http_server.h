@@ -59,6 +59,10 @@ esp_err_t http_server_start(void);
 esp_err_t http_server_stop(void);
 esp_err_t http_server_webim_bind_im(void);
 
+/* Get the underlying HTTP server handle (for registering custom URI handlers) */
+#include "esp_http_server.h"
+httpd_handle_t http_server_get_handle(void);
+
 #ifdef __cplusplus
 }
 #endif

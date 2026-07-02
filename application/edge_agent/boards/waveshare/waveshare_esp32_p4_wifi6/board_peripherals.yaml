@@ -1,0 +1,81 @@
+version: 1.0.0
+# Peripherals Configuration for Waveshare ESP32-P4-WIFI6
+# Based on schematic: ESP32-P4-WIFI6-datasheet.pdf
+peripherals:
+  # I2C Configuration (shared by codec, camera, touch)
+  - name: i2c_master
+    type: i2c
+    role: master
+    config:
+      port: 0
+      pins:
+        sda: 7     # ESP_I2C_SDA
+        scl: 8     # ESP_I2C_SCL
+
+  # I2S Audio Output (ESP -> ES8311 DAC)
+  - name: i2s_audio_out
+    type: i2s
+    format: "std-out"
+    role: master
+    config: &i2s_config
+      port: 0
+      sample_rate_hz: 48000
+      clk_src: "I2S_CLK_SRC_DEFAULT"
+      mclk_multiple: 256
+      data_bit_width: 16
+      slot_mode: "I2S_SLOT_MODE_STEREO"
+      slot_mask: "I2S_STD_SLOT_BOTH"
+      ws_width: 16
+      pins:
+        mclk: 13   # I2S_MCLK
+        bclk: 12   # I2S_SCLK
+        ws: 10     # I2S_LRCK
+        dout: 11   # I2S_DSDIN (ESP data out -> codec DIN)
+        din: 9     # I2S_ASDOUT (codec DOUT -> ESP data in)
+
+  # I2S Audio Input (ES8311 ADC -> ESP)
+  - name: i2s_audio_in
+    type: i2s
+    format: "std-in"
+    role: master
+    config: *i2s_config
+
+  # PA Control GPIO (NS4150B amplifier enable)
+  - name: gpio_pa_control
+    type: gpio
+    role: io
+    config:
+      pin: 53       # PA_CTRL
+      mode: GPIO_MODE_OUTPUT
+      pull_up: true
+      default_level: 0
+
+  # LDO Configuration for MIPI Power Supply
+  - name: ldo_mipi
+    type: ldo
+    config:
+      chan_id: 3        # VO3_LDO used for MIPI power
+      voltage_mv: 2500  # 2.5V for MIPI DPHY
+      adjustable: 1
+      owned_by_hw: 0
+
+  # DSI Configuration (for external Waveshare DSI display)
+  - name: dsi_display
+    type: dsi
+    config:
+      bus_id: 0
+      data_lanes: 2
+      phy_clk_src: 0
+      lane_bit_rate_mbps: 1000
+
+  # LCD Backlight Control via LEDC PWM (GPIO20 on 40-pin header)
+  - name: ledc_backlight
+    type: ledc
+    version: default
+    config:
+      gpio_num: 20
+      speed_mode: LEDC_LOW_SPEED_MODE
+      channel: 1
+      timer_sel: 1
+      duty: 0
+      output_invert: true

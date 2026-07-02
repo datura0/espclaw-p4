@@ -107,3 +107,8 @@ esp_err_t http_server_stop(void)
     }
     return err;
 }
+
+httpd_handle_t http_server_get_handle(void)
+{
+    return s_ctx.server;
+}

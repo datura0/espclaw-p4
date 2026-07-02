@@ -2,4 +2,9 @@
 dependencies:
   display_arbiter:
     path: ../../common/display_arbiter
-  lvgl/lvgl: ^9.5.0
+    rules:
+      - if: $CONFIG{ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT} == True
+  lvgl/lvgl:
+    version: ^9.5.0
+    rules:
+      - if: $CONFIG{ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT} == True

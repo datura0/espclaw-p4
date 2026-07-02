@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "cmd_espnow.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        console
+        espnow_bridge
+)

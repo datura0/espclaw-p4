@@ -1,0 +1,89 @@
+version: 1.0.0
+# Devices Configuration for Waveshare ESP32-P4-WIFI6 (套餐A)
+# Based on schematic: ESP32-P4-WIFI6-datasheet.pdf
+devices:
+  # Audio DAC via ES8311 codec
+  - name: audio_dac
+    chip: es8311  # Codec chip (ES8311)
+    type: audio_codec
+    version: default
+    config:
+      dac_enabled: true
+      dac_max_channel: 2
+      dac_channel_mask: "11"  # Enable both left and right channels
+      mclk_enabled: true      # MCLK pin (GPIO13) is wired to ES8311
+
+    peripherals:
+      - name: gpio_pa_control
+        gain: 6
+        active_level: 1
+
+      # I2S interface for audio output
+      - name: i2s_audio_out
+
+      # I2C interface for codec control
+      - name: i2c_master
+        address: 0x30    # ES8311 8-bit I2C address (7-bit: 0x18)
+        frequency: 400000
+
+  # Audio ADC via ES8311 codec (onboard MEMS microphone)
+  - name: audio_adc
+    chip: es8311
+    type: audio_codec
+    version: default
+    config:
+      adc_enabled: true
+      adc_max_channel: 2
+      adc_channel_mask: "11"        # Enable both channels
+      adc_channel_labels: [RE, FC]  # DAC reference + ADC microphone
+      mclk_enabled: true
+
+    peripherals:
+      # I2S interface for audio input
+      - name: i2s_audio_in
+
+      # I2C interface for codec control
+      - name: i2c_master
+        address: 0x30
+        frequency: 400000
+
+  # SD Card via SDMMC (SDIO 3.0)
+  - name: fs_sdcard
+    type: fs_fat
+    sub_type: sdmmc
+    version: default
+    config:
+      sub_config:
+        slot: SDMMC_HOST_SLOT_0
+        frequency: SDMMC_FREQ_HIGHSPEED
+        bus_width: 4
+        pins:
+          clk: 44
+          cmd: 42
+          d0: 43
+          d1: 39
+          d2: 40
+          d3: 41
+          d4: 0
+          d5: 0
+          d6: 0
+          d7: 0
+        ldo_chan_id: 4  # Use LDO_VO4 to power SDMMC IO
+
+  # Camera via MIPI CSI (2-lane) — OV5647
+  - name: camera
+    type: camera
+    version: default
+    sub_type: "csi"
+    config:
+      csi_config:
+        reset_io: -1      # No dedicated camera reset on WIFI6
+        pwdn_io: -1       # No dedicated camera PWDN on WIFI6
+        dont_init_ldo: true  # Using periph_ldo to manage MIPI power
+    peripherals:
+      - name: "i2c_master"
+        frequency: 100000
+      - name: ldo_mipi
+
+  # System LED (power LED is hardwired, no programmable LED on this board)
+  # Buttons: BOOT (GPIO0) and RST are hardware-level, no custom device needed

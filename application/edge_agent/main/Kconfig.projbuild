@@ -60,3 +60,21 @@ menu "Default Search Settings"
 endmenu
 
 endmenu
+
+menu "IMU & Attitude Dispatch"
+
+    config IMU_SLAVE_MAC
+        string "Target slave MAC for attitude data"
+        default "ff:ff:ff:ff:ff:ff"
+        help
+            MAC of the slave that receives attitude.
+            Format: xx:xx:xx:xx:xx:xx (broadcast = ff:ff:ff:ff:ff:ff).
+
+    config IMU_SEND_INTERVAL_MS
+        int "Attitude send interval (ms)"
+        default 50
+        help
+            Interval between attitude transmissions.
+            JY61P: 10Hz→100ms, 100Hz→10ms.
+
+endmenu

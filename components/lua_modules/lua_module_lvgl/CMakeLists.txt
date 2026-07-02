@@ -1,5 +1,5 @@
-idf_component_register(
-    SRCS
+if(CONFIG_ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT)
+    set(lvgl_srcs
         "src/lua_module_lvgl.c"
         "src/lua_lvgl_core_widgets.c"
         "src/lua_lvgl_complex_widgets.c"
@@ -14,13 +14,17 @@ idf_component_register(
         "src/lua_lvgl_runtime.c"
         "src/lua_lvgl_style.c"
         "src/lua_lvgl_value.c"
-    INCLUDE_DIRS
-        "src"
+    )
+    set(lvgl_reqs display_arbiter esp_lcd esp_lcd_touch esp_timer lvgl)
+else()
+    set(lvgl_srcs "")
+    set(lvgl_reqs "")
+endif()
+
+idf_component_register(
+    SRCS ${lvgl_srcs}
+    INCLUDE_DIRS "src"
     REQUIRES
         cap_lua
-        display_arbiter
-        esp_lcd
-        esp_lcd_touch
-        esp_timer
-        lvgl
+        ${lvgl_reqs}
 )

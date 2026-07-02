@@ -1,5 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
+  espressif/esp_new_jpeg: "*"
   espressif/esp_board_manager:
     version: "^0.5.10"
     public: true
@@ -14,9 +15,13 @@ dependencies:
 
   espressif2022/esp_emote_expression:
     version: "^1.0.0"
+    rules:
+      - if: $CONFIG{ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT} == True
 
   espressif2022/esp_emote_gfx:
     version: "3.0.2"
+    rules:
+      - if: $CONFIG{ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT} == True
 
   app_claw:
     path: ../../../components/common/app_claw
@@ -47,7 +52,24 @@ dependencies:
   wifi_manager:
     path: ../../../components/common/wifi_manager
 
+  cap_lua:
+    path: ../../../components/claw_capabilities/cap_lua
+
+  espnow_bridge:
+    path: ../components/espnow_bridge
+
+  cmd_espnow:
+    path: ../components/cmd_espnow
+
+  sensor_imu:
+    path: ../components/sensor_imu
+
   esp_video:
     path: ../../../components/common/esp_video
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_CAMERA_SUPPORT} == True
+
+  espressif/esp_h264:
+    version: "^1.0"
     matches:
     - if: $CONFIG{ESP_BOARD_DEV_CAMERA_SUPPORT} == True

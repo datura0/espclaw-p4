@@ -1,0 +1,11 @@
+menu "ESP-NOW Bridge Config"
+
+    config ESPNOW_BRIDGE_CHANNEL
+        int "ESP-NOW channel (1-14)"
+        range 1 14
+        default 1
+        help
+            ESP-NOW operating channel. Must match the WiFi AP channel
+            used by your slave devices (e.g. s3test's "Datura" hotspot channel).
+
+endmenu
