@@ -63,18 +63,30 @@ endmenu
 
 menu "IMU & Attitude Dispatch"
 
-    config IMU_SLAVE_MAC
-        string "Target slave MAC for attitude data"
-        default "ff:ff:ff:ff:ff:ff"
-        help
-            MAC of the slave that receives attitude.
-            Format: xx:xx:xx:xx:xx:xx (broadcast = ff:ff:ff:ff:ff:ff).
-
     config IMU_SEND_INTERVAL_MS
         int "Attitude send interval (ms)"
         default 50
         help
             Interval between attitude transmissions.
             JY61P: 10Hz→100ms, 100Hz→10ms.
+
+    config MOTOR_YAW_MAC
+        string "YAW motor MAC"
+        default "ac:a7:04:f3:56:6c"
+        help
+            MAC of the yaw-axis motor (selected_axis=1).
+
+    config MOTOR_ROLL_MAC
+        string "ROLL motor MAC"
+        default "44:1b:f6:8b:fb:58"
+        help
+            MAC of the roll-axis motor (selected_axis=3).
+
+    config MOTOR_PITCH_MAC
+        string "PITCH motor MAC"
+        default "ff:ff:ff:ff:ff:ff"
+        help
+            MAC of the pitch-axis motor (selected_axis=2).
+            Set to actual MAC when known.
 
 endmenu

@@ -35,7 +35,6 @@ static bool           s_valid = false;
 
 /* ---- Quaternion state (anti-gimbal-lock) ---- */
 static float q0=1,q1=0,q2=0,q3=0;
-static float prev_r=0,prev_p=0,prev_y=0;
 static bool  quat_mode=false;
 
 /* ---- Helpers ---- */
@@ -46,17 +45,17 @@ static inline float raw_to_norm(int16_t raw) {
     return (float)raw / 32768.0f;
 }
 
-/* Quaternion → Euler (ZYX), with anti-flip */
+/* Quaternion → Euler (ZYX), wrap to ±180° */
 static void quat_to_euler(imu_attitude_t *att) {
     float a=q0,b=q1,c=q2,d=q3;
     att->roll  = atan2f(2*(a*b+c*d), 1-2*(b*b+c*c)) * 57.29578f;
     att->pitch = asinf(2*(a*c-d*b)) * 57.29578f;
     att->yaw   = atan2f(2*(a*d+b*c), 1-2*(c*c+d*d)) * 57.29578f;
-    while(att->roll  - prev_r > 180) att->roll  -= 360;
-    while(att->roll  - prev_r < -180) att->roll  += 360;
-    while(att->yaw   - prev_y > 180) att->yaw   -= 360;
-    while(att->yaw   - prev_y < -180) att->yaw   += 360;
-    prev_r=att->roll; prev_p=att->pitch; prev_y=att->yaw;
+    /* Wrap to ±180° — no accumulation */
+    while (att->roll  >  180.0f) att->roll  -= 360.0f;
+    while (att->roll  < -180.0f) att->roll  += 360.0f;
+    while (att->yaw   >  180.0f) att->yaw   -= 360.0f;
+    while (att->yaw   < -180.0f) att->yaw   += 360.0f;
 }
 
 /* Parse an 11-byte JY61P packet */
@@ -79,12 +78,11 @@ static bool parse_packet(const uint8_t *pkt, imu_attitude_t *att) {
         att->roll  = raw_to_deg((int16_t)(pkt[2]|(pkt[3]<<8)));
         att->pitch = raw_to_deg((int16_t)(pkt[4]|(pkt[5]<<8)));
         att->yaw   = raw_to_deg((int16_t)(pkt[6]|(pkt[7]<<8)));
-        // 防翻转
-        while(att->roll - prev_r > 180) att->roll -= 360;
-        while(att->roll - prev_r < -180) att->roll += 360;
-        while(att->yaw  - prev_y > 180) att->yaw  -= 360;
-        while(att->yaw  - prev_y < -180) att->yaw  += 360;
-        prev_r=att->roll; prev_p=att->pitch; prev_y=att->yaw;
+        /* Wrap to ±180° */
+        while(att->roll > 180)   att->roll -= 360;
+        while(att->roll < -180)  att->roll += 360;
+        while(att->yaw  > 180)   att->yaw  -= 360;
+        while(att->yaw  < -180)  att->yaw  += 360;
         return true;
     }
     return false;

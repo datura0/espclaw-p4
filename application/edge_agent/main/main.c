@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"
 #include "esp_board_manager_includes.h"
 #include "captive_dns.h"
 #include "cmd_wifi.h"
@@ -53,6 +54,11 @@ esp_err_t cap_im_wechat_qr_login_mark_persisted(void);
 #include "sensor_imu.h"
 #include "esp_wifi.h"
 #include "driver/gpio.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "lwip/sockets.h"
+
+#define P4_FIRMWARE_URL "http://192.168.137.1:8000/edge_agent.bin"
 
 #define APP_ENABLE_MEM_LOG        (0)
 
@@ -410,148 +416,238 @@ static void on_espnow_bridge_event(uint8_t type,
 }
 
 /* ---- Button & IMU Lock ---- */
-#define BTN_LOCK_GPIO      GPIO_NUM_20   /* press to lock current IMU attitude */
-#define MOTOR_CMD_POSITION 0x40          /* motor control: 1B cmd + 1B mode + 12B angle_diffs */
+#define BTN_LOCK_GPIO      GPIO_NUM_21   /* 按一次锁定云台姿态, 再按一次解锁 */
 
 static bool           s_locked = false;
+static int            lock_burst = 0;   /* burst-counter: 10→0, first 500ms after lock */
 static imu_attitude_t s_lock_ref;        /* reference attitude at lock moment */
 
 /* ---- IMU Attitude Dispatch Task ---- */
 
 #define IMU_CMD_ATTITUDE  0x30   /* roll(4B) + pitch(4B) + yaw(4B) */
 
-static uint8_t s_roll_mac[6], s_pitch_mac[6], s_yaw_mac[6];
-static const uint8_t s_remote_mac[6] = {0x44,0x1b,0xf6,0xd7,0x99,0x04};  // 遥控器
-
-static int hex_digit(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
+/* ===== Yaw wrap helper ===== */
+static inline float wrap_yaw_err(float err) {
+    if (err >  180.0f) err -= 360.0f;
+    if (err < -180.0f) err += 360.0f;
+    return err;
 }
 
-static bool parse_mac_string(const char *s, uint8_t mac[6])
+/* ===== Stabilizer PID (one per axis) =====
+   Error in degrees (°), output in rad/s.
+   Kp/Kd/Ki multiplied by DEG2RADf to convert °→rad internally */
+#define DEG2RADf      0.0174533f
+#define STAB_OUT_LIMIT 6.0f       /* rad/s — ±1 rev/s max */
+#define STAB_INT_LIMIT 0.5f       /* rad·s */
+
+/* Roll  (M1) — asymmetric gains */
+#define ROLL_KP_POS  (5.0f  * DEG2RADf)    /* ≈0.087 rad/s per ° */
+#define ROLL_KD_POS  (2.50f * DEG2RADf)    /* damping */
+#define ROLL_KI_POS  (0.10f * DEG2RADf)
+#define ROLL_KP_NEG  (5.0f  * DEG2RADf)
+#define ROLL_KD_NEG  (2.50f * DEG2RADf)
+
+/* Pitch (M2) */
+#define PITCH_KP_POS (3.0f  * DEG2RADf)    /* ≈0.052 rad/s per ° */
+#define PITCH_KD_POS (1.50f * DEG2RADf)
+#define PITCH_KI_POS (0.0f)
+#define PITCH_KP_NEG (3.0f  * DEG2RADf)
+#define PITCH_KD_NEG (1.50f * DEG2RADf)
+
+/* Yaw   (M0) — symmetric */
+#define YAW_KP       (4.0f  * DEG2RADf)    /* ≈0.070 rad/s per ° */
+#define YAW_KD       (2.00f * DEG2RADf)
+#define YAW_KI       (0.10f * DEG2RADf)
+
+typedef struct {
+    float integral;
+    float last_error;
+    float last_deriv;     /* filtered derivative */
+    int   last_sign;
+    int64_t last_us;      /* for actual dt measurement */
+} StabPID_t;
+
+static StabPID_t stab_r, stab_p, stab_y;
+
+#define DERIV_LP_ALPHA  0.3f    /* derivative low-pass: 0=full filter, 1=raw */
+#define DEADBAND_DEG    0.3f    /* ignore errors < 0.3° */
+
+/* One PID step: error in degrees, dt in seconds → speed in rad/s.
+   Uses measured dt, filtered derivative, and deadband. */
+static float stab_pid_update(StabPID_t *s, float error_deg, float dt,
+                              float kp_pos, float kd_pos, float ki_pos,
+                              float kp_neg, float kd_neg, float ki_neg)
 {
-    int idx = 0;
-    for (int i = 0; s[i] && idx < 6; i++) {
-        if (s[i] == ':' || s[i] == '-') continue;
-        int hi = hex_digit(s[i]);
-        if (hi < 0 || !s[i+1]) return false;
-        int lo = hex_digit(s[i+1]);
-        if (lo < 0) return false;
-        mac[idx++] = (uint8_t)((hi << 4) | lo);
-        i++;
+    /* ---- deadband: stop jitter from IMU noise ---- */
+    if ((error_deg < 0 ? -error_deg : error_deg) < DEADBAND_DEG) {
+        s->last_error = error_deg;
+        s->integral *= 0.95f;   /* slowly decay integral in deadband */
+        return 0.0f;
     }
-    return (idx == 6);
+
+    /* ---- asymmetric gains ---- */
+    float kp, kd, ki;
+    if (error_deg > 0.0f) { kp = kp_pos; kd = kd_pos; ki = ki_pos; }
+    else                   { kp = kp_neg; kd = kd_neg; ki = ki_neg; }
+
+    /* ---- filtered derivative (suppress IMU noise) ---- */
+    float raw_deriv = (error_deg - s->last_error) / ((dt > 0.001f) ? dt : 0.001f);
+    s->last_deriv = DERIV_LP_ALPHA * raw_deriv + (1.0f - DERIV_LP_ALPHA) * s->last_deriv;
+    s->last_error = error_deg;
+
+    /* ---- soft anti‑windup: decay, don't reset on sign change ---- */
+    int sign = (error_deg > 0.0f) ? 1 : (error_deg < 0.0f) ? -1 : 0;
+    if (sign != s->last_sign) {
+        s->integral *= 0.5f;     /* halve instead of reset */
+        s->last_sign = sign;
+    }
+    s->integral += error_deg * dt;
+    if (s->integral >  STAB_INT_LIMIT) s->integral =  STAB_INT_LIMIT;
+    if (s->integral < -STAB_INT_LIMIT) s->integral = -STAB_INT_LIMIT;
+
+    float out = kp * error_deg + kd * s->last_deriv + ki * s->integral;
+    if (out >  STAB_OUT_LIMIT) out =  STAB_OUT_LIMIT;
+    if (out < -STAB_OUT_LIMIT) out = -STAB_OUT_LIMIT;
+    return out;
+}
+
+/* Reset PID state (call on new lock) */
+static void stab_pid_reset(StabPID_t *s) {
+    s->integral = 0.0f;
+    s->last_error = 0.0f;
+    s->last_deriv = 0.0f;
+    s->last_sign = 0;
+    s->last_us = 0;
 }
 
 static void imu_dispatch_task(void *arg)
 {
     (void)arg;
 
-    /* Parse three slave MACs */
-    if (!parse_mac_string(CONFIG_MOTOR_ROLL_MAC, s_roll_mac)) {
-        ESP_LOGE(TAG, "Invalid ROLL_MAC, using broadcast");
-        memset(s_roll_mac, 0xFF, 6);
-    }
-    if (!parse_mac_string(CONFIG_MOTOR_PITCH_MAC, s_pitch_mac)) {
-        ESP_LOGE(TAG, "Invalid PITCH_MAC, using broadcast");
-        memset(s_pitch_mac, 0xFF, 6);
-    }
-    if (!parse_mac_string(CONFIG_MOTOR_YAW_MAC, s_yaw_mac)) {
-        ESP_LOGE(TAG, "Invalid YAW_MAC, using broadcast");
-        memset(s_yaw_mac, 0xFF, 6);
-    }
-    ESP_LOGI(TAG, "IMU dispatch every %d ms to 3 motors", CONFIG_IMU_SEND_INTERVAL_MS);
+    static const uint8_t bc_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    static bool pids_inited = false;
+
+    /* ── VOFA JustFloat UDP (port 8082, lazy init after WiFi ready) ── */
+    int vofa_sock = -1;
+    struct sockaddr_in vofa_addr = {0};
+
+    /* Helper: send N floats as VOFA JustFloat frame */
+#define VOFA_SEND_FLOATS(sock, addr, data, n) do { \
+        if ((sock) < 0) break; \
+        uint8_t _buf[(n)*4 + 4]; \
+        for (int _i = 0; _i < (n); _i++) { \
+            float _f = (data)[_i]; \
+            memcpy(_buf + _i*4, &_f, 4); \
+        } \
+        _buf[(n)*4+0]=0x00; _buf[(n)*4+1]=0x00; _buf[(n)*4+2]=0x80; _buf[(n)*4+3]=0x7F; \
+        sendto((sock), _buf, (n)*4+4, 0, (struct sockaddr *)(addr), sizeof(*(addr))); \
+    } while(0)
 
     while (1) {
         imu_attitude_t att;
         esp_err_t err = imu_sensor_get_attitude(&att);
         if (err == ESP_OK) {
+            /* ── VOFA socket: lazy init ── */
+            if (vofa_sock < 0) {
+                vofa_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+                vofa_addr.sin_family = AF_INET;
+                vofa_addr.sin_port = htons(8082);
+                vofa_addr.sin_addr.s_addr = inet_addr("192.168.137.1");
+                if (vofa_sock >= 0) ESP_LOGI(TAG, "VOFA UDP → 192.168.137.1:8082 OK");
+            }
+
+            /* ── Unified 0x30 packet: IMU + lock + speeds (26 bytes) ── */
+            /* Layout: [0x30][lock:1][roll:4][pitch:4][yaw:4][yaw_spd:4][pitch_spd:4][roll_spd:4] */
+            uint8_t pkt[26];
+            pkt[0] = 0x30;
+            pkt[1] = s_locked ? 1 : 0;
+
+            float neg_pitch = -att.pitch;
+            memcpy(pkt + 2,  &att.roll,   4);
+            memcpy(pkt + 6,  &neg_pitch,   4);
+            memcpy(pkt + 10, &att.yaw,    4);
+
+            float spd_y=0, spd_p=0, spd_r=0;
             if (s_locked) {
-                /* Per-axis: send single-axis command to each motor */
-                float roll_diff  = att.roll  - s_lock_ref.roll;
-                float pitch_diff = att.pitch - s_lock_ref.pitch;
-                float yaw_diff   = att.yaw   - s_lock_ref.yaw;
-                if (yaw_diff >  180.0f) yaw_diff -= 360.0f;
-                if (yaw_diff < -180.0f) yaw_diff += 360.0f;
+                float dt = (float)CONFIG_IMU_SEND_INTERVAL_MS * 0.001f;
+                float err_roll  = wrap_yaw_err(s_lock_ref.roll  - att.roll);
+                float err_pitch = wrap_yaw_err(s_lock_ref.pitch - att.pitch);
+                float err_yaw   = wrap_yaw_err(s_lock_ref.yaw   - att.yaw);
 
-                uint8_t pkt[7];
-                pkt[0] = 0x41;      /* MOTOR_CMD_AXIS */
-                pkt[2] = 0x01;      /* position mode */
+                #define ABSF(x)  ((x)<0?-(x):(x))
+                #define MINF(a,b) ((a)<(b)?(a):(b))
 
-                pkt[1] = 0;         /* x = roll */
-                memcpy(pkt + 3, &roll_diff, 4);
-                espnow_bridge_send_espnow(s_roll_mac, pkt, sizeof(pkt));
+                spd_r = (ABSF(err_roll)  < 0.5f) ? 0 : (err_roll  > 0 ? 1 : -1) * MINF(ABSF(err_roll)  * 0.06f, 4.0f);
+                spd_p = (ABSF(err_pitch) < 0.5f) ? 0 : (err_pitch > 0 ? 1 : -1) * MINF(ABSF(err_pitch) * 0.15f, 10.0f);
+                spd_y = (ABSF(err_yaw) < 0.3f) ? 0 : (err_yaw > 0 ? 1 : -1) * MINF(ABSF(err_yaw) * 0.08f, 4.0f);
+            }
 
-                pkt[1] = 1;         /* y = pitch */
-                memcpy(pkt + 3, &pitch_diff, 4);
-                espnow_bridge_send_espnow(s_pitch_mac, pkt, sizeof(pkt));
+            /* All three axes inverted in packet */
+            float inv_spd_y = -spd_y, inv_spd_p = -spd_p, inv_spd_r = -spd_r;
+            memcpy(pkt + 14, &inv_spd_y, 4);
+            memcpy(pkt + 18, &inv_spd_p, 4);
+            memcpy(pkt + 22, &inv_spd_r, 4);
 
-                pkt[1] = 2;         /* z = yaw */
-                memcpy(pkt + 3, &yaw_diff, 4);
-                espnow_bridge_send_espnow(s_yaw_mac, pkt, sizeof(pkt));
-                /* Log every 20th packet to confirm diffs are changing */
-                static int cnt = 0;
-                if (++cnt % 20 == 0) {
-                    ESP_LOGI(TAG, "MOTOR→ yaw=%+.2f° roll=%+.2f° pitch=%+.2f°",
-                             (double)yaw_diff, (double)roll_diff, (double)pitch_diff);
-                }
+            espnow_bridge_send_espnow(bc_mac, pkt, sizeof(pkt));
+
+            /* VOFA telemetry */
+            if (s_locked) {
+                float vofa[12] = { att.roll, att.pitch, att.yaw,
+                    s_lock_ref.roll, s_lock_ref.pitch, s_lock_ref.yaw,
+                    s_lock_ref.roll-att.roll, s_lock_ref.pitch-att.pitch, wrap_yaw_err(s_lock_ref.yaw-att.yaw),
+                    spd_r, spd_p, spd_y };
+                VOFA_SEND_FLOATS(vofa_sock, &vofa_addr, vofa, 12);
             } else {
-                /* IMU attitude to all three motors */
-                uint8_t pkt[13];
-                pkt[0] = IMU_CMD_ATTITUDE;
-                memcpy(pkt + 1, &att.roll, 4);
-                memcpy(pkt + 5, &att.pitch, 4);
-                memcpy(pkt + 9, &att.yaw, 4);
-                espnow_bridge_send_espnow(s_roll_mac, pkt, sizeof(pkt));
-                espnow_bridge_send_espnow(s_pitch_mac, pkt, sizeof(pkt));
-                espnow_bridge_send_espnow(s_yaw_mac, pkt, sizeof(pkt));
-                espnow_bridge_send_espnow(s_remote_mac, pkt, sizeof(pkt));  // 遥控器
+                float vofa_u[3] = { att.roll, att.pitch, att.yaw };
+                VOFA_SEND_FLOATS(vofa_sock, &vofa_addr, vofa_u, 3);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(CONFIG_IMU_SEND_INTERVAL_MS));
     }
 }
 
-/* ---- Button Lock Task: monitor IO20, lock IMU reference on press ---- */
+/* ---- Button Toggle Task: IO21 toggles gimbal lock ---- */
 static void btn_lock_task(void *arg)
 {
     (void)arg;
     gpio_set_direction(BTN_LOCK_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(BTN_LOCK_GPIO, GPIO_PULLUP_ONLY);
-    gpio_set_direction(GPIO_NUM_21, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(GPIO_NUM_21, GPIO_PULLUP_ONLY);
-    ESP_LOGI(TAG, "IO20=lock / IO21=unlock");
+    ESP_LOGI(TAG, "IO21=toggle lock (press to lock/unlock)");
 
-    bool last20 = true, last21 = true;
+    bool last = true;
     while (1) {
-        bool now20 = gpio_get_level(BTN_LOCK_GPIO);
-        bool now21 = gpio_get_level(GPIO_NUM_21);
-        if (last20 && !now20) {  /* IO20 press: lock */
+        bool now = gpio_get_level(BTN_LOCK_GPIO);       /* IO21 — LOW when pressed */
+        if (last && !now) {  /* falling edge = press */
             vTaskDelay(pdMS_TO_TICKS(30));
             if (!gpio_get_level(BTN_LOCK_GPIO)) {
-                imu_attitude_t att;
-                if (imu_sensor_get_attitude(&att) == ESP_OK) {
-                    s_lock_ref = att;
-                    s_locked = true;
-                    ESP_LOGI(TAG, "*** LOCKED: roll=%.2f pitch=%.2f yaw=%.2f ***",
-                             (double)att.roll, (double)att.pitch, (double)att.yaw);
+                if (s_locked) {
+                    /* Unlock: stop sending 0x50 → motors timeout & stop */
+                    s_locked = false;
+                    lock_burst = 0;
+                    ESP_LOGI(TAG, "*** UNLOCKED ***");
+                    /* Send zero-speed command to stop motors gracefully */
+                    uint8_t pkt[13] = {0x50, 0,0,0,0, 0,0,0,0, 0,0,0,0};
+                    static const uint8_t bc[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+                    for (int r = 0; r < 3; r++) {
+                        espnow_bridge_send_espnow(bc, pkt, sizeof(pkt));
+                        if (r < 2) esp_rom_delay_us(2000);
+                    }
                 } else {
-                    ESP_LOGW(TAG, "Lock failed: IMU not ready");
+                    /* Lock: capture current IMU attitude */
+                    imu_attitude_t att;
+                    if (imu_sensor_get_attitude(&att) == ESP_OK) {
+                        s_lock_ref = att;
+                        s_locked = true;
+                        lock_burst = 10;   /* burst-send for first 500ms */
+                        ESP_LOGI(TAG, "*** LOCKED: roll=%.2f pitch=%.2f yaw=%.2f ***",
+                                 (double)att.roll, (double)att.pitch, (double)att.yaw);
+                    } else {
+                        ESP_LOGW(TAG, "Lock failed: IMU not ready");
+                    }
                 }
             }
         }
-        if (last21 && !now21) {  /* IO21 press: unlock */
-            vTaskDelay(pdMS_TO_TICKS(30));
-            if (!gpio_get_level(GPIO_NUM_21)) {
-                s_locked = false;
-                ESP_LOGI(TAG, "*** UNLOCKED — back to speed mode ***");
-            }
-        }
-        last20 = now20;
-        last21 = now21;
+        last = now;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -668,6 +764,29 @@ static const uint8_t s_font_3x5[10][5] = {
 /* Draw FPS digits onto UYVY buffer at top-left.
    UYVY: 4 bytes per 2 pixels = [U, Y0, V, Y1].
    White text (Y=235, U=V=128) on black bg (Y=16, U=V=128). */
+
+/* Mirror UYVY frame horizontally — swap pixel pairs in each row.
+   UYVY macro-pixel = 4 bytes = [U, Y0, V, Y1] covering 2 pixels.
+   Mirror: swap macro-pixels in each row. */
+static void uyvy_mirror_h(uint8_t *uyvy, int w, int h)
+{
+    const int row_bytes = w * 2;          /* 2 bytes per pixel for UYVY */
+    const int pair_bytes = 4;             /* one UYVY macro-pixel */
+    const int pairs_per_row = w / 2;      /* 2 pixels per macro-pixel */
+    uint8_t tmp[4];
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = uyvy + y * row_bytes;
+        for (int x = 0; x < pairs_per_row / 2; x++) {
+            uint8_t *left  = row + x * pair_bytes;
+            uint8_t *right = row + (pairs_per_row - 1 - x) * pair_bytes;
+            memcpy(tmp,   left,  4);
+            memcpy(left,  right, 4);
+            memcpy(right, tmp,   4);
+        }
+    }
+}
+
 static void draw_fps_on_frame(uint8_t *uyvy, int w, int h, int fps)
 {
     const int scale = 3;
@@ -785,6 +904,11 @@ static void camera_capture_task(void *arg)
     ctrl.value = V4L2_EXPOSURE_AUTO;  /* auto exposure */
     ioctl(cam_fd, VIDIOC_S_CTRL, &ctrl);
 
+    /* Horizontal mirror — camera is mounted facing user, flip for correct orientation */
+    ctrl.id = V4L2_CID_HFLIP;
+    ctrl.value = 1;
+    if (ioctl(cam_fd, VIDIOC_S_CTRL, &ctrl) == 0) ESP_LOGI(TAG, "HFlip: %d", ctrl.value);
+
     struct v4l2_requestbuffers req = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP, .count = 6 };
     ioctl(cam_fd, VIDIOC_REQBUFS, &req);
     uint8_t *cam_bufs[6];
@@ -841,6 +965,23 @@ static void camera_capture_task(void *arg)
         struct v4l2_buffer vbuf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
 
         if (ioctl(cam_fd, VIDIOC_DQBUF, &vbuf) != 0) { vTaskDelay(1); continue; }
+
+        /* Flip vertically: swap rows top↔bottom */
+        {
+            static uint8_t row_buf[800 * 2];
+            int row_bytes = CAM_W * 2;
+            uint8_t *frame = cam_bufs[vbuf.index];
+            for (int y = 0; y < CAM_H / 2; y++) {
+                uint8_t *top = frame + y * row_bytes;
+                uint8_t *bot = frame + (CAM_H - 1 - y) * row_bytes;
+                memcpy(row_buf, top, row_bytes);
+                memcpy(top, bot, row_bytes);
+                memcpy(bot, row_buf, row_bytes);
+            }
+        }
+        /* Mirror horizontally: swap UYVY macro-pixels in each row */
+        uyvy_mirror_h(cam_bufs[vbuf.index], CAM_W, CAM_H);
+
         int64_t t1 = esp_timer_get_time();
 
         /* FPS: calculate every 2 seconds */
@@ -1021,6 +1162,244 @@ static esp_err_t mjpeg_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- OTA Firmware Update Page: GET=show form, POST=upload ---- */
+static const char OTA_HTML[] =
+"<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>ESP-Claw OTA</title>"
+"<style>"
+"*{margin:0;padding:0;box-sizing:border-box}"
+"body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;min-height:100vh}"
+".card{background:#16213e;border-radius:12px;padding:32px;max-width:420px;width:90%;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.4)}"
+"h1{color:#0f3460;margin-bottom:8px;font-size:28px}"
+"h1 span{color:#e94560}"
+".ver{color:#888;font-size:12px;margin-bottom:24px}"
+".drop-zone{border:2px dashed #0f3460;border-radius:10px;padding:40px 20px;margin:20px 0;transition:.3s;cursor:pointer}"
+".drop-zone:hover,.drop-zone.drag{border-color:#e94560;background:rgba(233,69,96,.08)}"
+".drop-zone p{color:#888;font-size:14px}"
+".drop-zone .icon{font-size:48px;margin-bottom:12px}"
+"#fileInput{display:none}"
+"#fileName{color:#e94560;font-size:13px;margin-top:8px;word-break:break-all}"
+"button{background:linear-gradient(135deg,#e94560,#0f3460);color:#fff;border:none;padding:14px 48px;border-radius:8px;font-size:16px;cursor:pointer;margin-top:16px;transition:.3s}"
+"button:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(233,69,96,.4)}"
+"button:disabled{opacity:.4;cursor:not-allowed;transform:none}"
+".progress{width:100%;height:6px;background:#0f3460;border-radius:3px;margin:20px 0 8px;overflow:hidden;display:none}"
+".progress .bar{height:100%;width:0;background:linear-gradient(90deg,#e94560,#f77);border-radius:3px;transition:width .2s}"
+"#status{font-size:13px;color:#888;margin-top:8px;min-height:20px}"
+".info{background:rgba(15,52,96,.5);border-radius:8px;padding:12px;margin-top:20px;font-size:12px;color:#888;text-align:left;line-height:1.6}"
+".info b{color:#e94560}"
+"@keyframes spin{to{transform:rotate(360deg)}}"
+".spinner{width:20px;height:20px;border:2px solid #0f3460;border-top-color:#e94560;border-radius:50%;animation:spin .8s linear infinite;display:none;margin:12px auto}"
+"</style></head><body>"
+"<div class=\"card\">"
+"<h1>ESP<span>Claw</span></h1><div class=\"ver\">OTA Firmware Update</div>"
+"<div class=\"drop-zone\" id=\"dropZone\" onclick=\"document.getElementById('fileInput').click()\">"
+"<div class=\"icon\">&#128193;</div>"
+"<p>Click or drag .bin file here</p>"
+"<div id=\"fileName\"></div>"
+"</div>"
+"<input type=\"file\" id=\"fileInput\" accept=\".bin\">"
+"<button id=\"uploadBtn\" disabled onclick=\"doUpload()\">Upload &amp; Update</button>"
+"<div class=\"spinner\" id=\"spinner\"></div>"
+"<div class=\"progress\" id=\"progress\"><div class=\"bar\" id=\"bar\"></div></div>"
+"<div id=\"status\"></div>"
+"<div class=\"info\">"
+"<b>Current:</b> OTA_0 / OTA_1<br>"
+"<b>Partition:</b> 8MB each<br>"
+"<b>Upload:</b> .bin firmware image<br>"
+"<b>After:</b> Auto reboot in 2s"
+"</div></div>"
+"<script>"
+"var f;"
+"document.getElementById('fileInput').onchange=function(e){f=e.target.files[0];document.getElementById('fileName').textContent=f?f.name+' ('+(f.size/1024).toFixed(0)+'KB)':'';document.getElementById('uploadBtn').disabled=!f};"
+"var dz=document.getElementById('dropZone');"
+"dz.ondragover=function(e){e.preventDefault();dz.classList.add('drag')};"
+"dz.ondragleave=function(){dz.classList.remove('drag')};"
+"dz.ondrop=function(e){e.preventDefault();dz.classList.remove('drag');var d=e.dataTransfer.files[0];if(d){var fi=document.getElementById('fileInput');var dt=new DataTransfer();dt.items.add(d);fi.files=dt.files;fi.onchange()}};"
+"function doUpload(){if(!f)return;var x=new XMLHttpRequest();x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);document.getElementById('bar').style.width=p+'%';document.getElementById('progress').style.display='block';document.getElementById('status').textContent=p+'%'}};"
+"x.onload=function(){document.getElementById('spinner').style.display='none';document.getElementById('status').textContent='Done! Rebooting...';document.getElementById('status').style.color='#4ecca3';setTimeout(function(){location.reload()},5000)};"
+"x.onerror=function(){document.getElementById('spinner').style.display='none';document.getElementById('status').textContent='Upload failed!';document.getElementById('status').style.color='#e94560'};"
+"x.open('POST','/ota');document.getElementById('uploadBtn').disabled=true;document.getElementById('spinner').style.display='block';document.getElementById('status').textContent='Uploading...';x.send(f)}"
+"</script></body></html>";
+
+static esp_err_t ota_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, OTA_HTML, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (req->method != HTTP_POST) {
+        httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, "Only GET/POST allowed");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(8192);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int content_len = req->content_len;
+    if (content_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_411_LENGTH_REQUIRED, "Content-Length required");
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA: starting update, size=%d bytes", content_len);
+
+    esp_ota_handle_t ota_handle = 0;
+    const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
+    if (!update_part) {
+        ESP_LOGE(TAG, "OTA: no update partition found");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        free(buf);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "OTA: writing to partition %s...", update_part->label);
+
+    int remaining = content_len;
+    int received = 0;
+    int last_pct = -1;
+
+    while (remaining > 0) {
+        int to_read = (remaining < 8192) ? remaining : 8192;
+        int read = httpd_req_recv(req, buf, to_read);
+        if (read <= 0) {
+            if (read == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            ESP_LOGE(TAG, "OTA: recv error (read=%d)", read);
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Transfer interrupted");
+            free(buf);
+            return ESP_FAIL;
+        }
+
+        err = esp_ota_write(ota_handle, buf, read);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: write error: %s", esp_err_to_name(err));
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash write failed");
+            free(buf);
+            return ESP_FAIL;
+            return ESP_FAIL;
+        }
+
+        received += read;
+        remaining -= read;
+        int pct = received * 100 / content_len;
+        if (pct != last_pct && pct % 10 == 0) {
+            ESP_LOGI(TAG, "OTA: %d%% (%d/%d)", pct, received, content_len);
+            last_pct = pct;
+        }
+    }
+
+    ESP_LOGI(TAG, "OTA: 100%% (%d bytes) — finishing...", received);
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_end failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA end failed");
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(update_part);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Boot partition set failed");
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA: SUCCESS! Restarting in 2 seconds...");
+    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    free(buf);
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    return ESP_OK;
+}
+
+/* ---- BOOT button OTA trigger (GPIO0 long press) ---- */
+#define BOOT_BUTTON_GPIO 0
+
+static void boot_ota_task(void *arg)
+{
+    (void)arg;
+    gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
+    ESP_LOGI(TAG, "BOOT(GPIO0) OTA: long press to trigger");
+
+    while (1) {
+        if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+                ESP_LOGI(TAG, "BOOT: OTA triggered — downloading...");
+                esp_http_client_config_t http_cfg = {.url = P4_FIRMWARE_URL, .timeout_ms = 60000};
+                esp_https_ota_config_t ota_cfg = {.http_config = &http_cfg};
+                esp_err_t err = esp_https_ota(&ota_cfg);
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "OTA: success! Restarting...");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    esp_restart();
+                } else {
+                    ESP_LOGE(TAG, "OTA: failed (%s)", esp_err_to_name(err));
+                }
+                while (gpio_get_level(BOOT_BUTTON_GPIO) == 0) vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/* ---- Simple UDP OTA trigger (like motors) ---- */
+
+static void p4_ota_task(void *arg)
+{
+    (void)arg;
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) { ESP_LOGE(TAG, "OTA: socket failed"); vTaskDelete(NULL); return; }
+    struct sockaddr_in bind_addr = {.sin_family=AF_INET, .sin_port=htons(8080), .sin_addr.s_addr=INADDR_ANY};
+    if (bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        /* 8080 might be taken, try 8081 */
+        bind_addr.sin_port = htons(8081);
+        if (bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+            ESP_LOGE(TAG, "OTA: bind failed"); close(sock); vTaskDelete(NULL); return;
+        }
+        ESP_LOGI(TAG, "OTA trigger: UDP port 8081");
+    } else {
+        ESP_LOGI(TAG, "OTA trigger: UDP port 8080 (send 'o' to trigger)");
+    }
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    char buf[32];
+    while (1) {
+        int n = recvfrom(sock, buf, sizeof(buf)-1, 0, NULL, NULL);
+        if (n > 0 && buf[0] == 'o') {
+            ESP_LOGI(TAG, "OTA: UDP trigger received — starting download...");
+            esp_http_client_config_t http_cfg = {.url = P4_FIRMWARE_URL, .timeout_ms = 30000};
+            esp_https_ota_config_t ota_cfg = {.http_config = &http_cfg};
+            esp_err_t err = esp_https_ota(&ota_cfg);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "OTA: success, restarting...");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                esp_restart();
+            } else {
+                ESP_LOGE(TAG, "OTA: failed (%s)", esp_err_to_name(err));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
 void app_main(void)
 {
     esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_WARN);
@@ -1037,8 +1416,9 @@ void app_main(void)
     ESP_ERROR_CHECK(espnow_bridge_init());
     espnow_bridge_register_event_callback(on_espnow_bridge_event, NULL);
     ESP_ERROR_CHECK(imu_sensor_init(on_imu_data, NULL));
-    xTaskCreate(imu_dispatch_task, "imu_disp", 3072, NULL, 5, NULL);
+    xTaskCreate(imu_dispatch_task, "imu_disp", 5120, NULL, 5, NULL);
     xTaskCreate(btn_lock_task, "btn_lock", 4096, NULL, 5, NULL);
+    xTaskCreate(boot_ota_task, "boot_ota", 4096, NULL, 2, NULL);
     ESP_ERROR_CHECK(app_claw_ui_start());
     ESP_ERROR_CHECK(init_fatfs());
     ESP_ERROR_CHECK(init_ramfs());
@@ -1145,6 +1525,19 @@ skip_wifi:
             ESP_LOGI(TAG, "MJPEG: http://<ip>/mjpeg");
         } else {
             ESP_LOGE(TAG, "MJPEG: register /mjpeg FAILED: %s", esp_err_to_name(reg_err));
+        }
+
+        /* OTA: register both GET (page) and POST (upload) */
+        httpd_uri_t ota_get = { .uri = "/ota", .method = HTTP_GET, .handler = ota_handler, .user_ctx = NULL };
+        reg_err = httpd_register_uri_handler(hd, &ota_get);
+        if (reg_err == ESP_OK) {
+            httpd_uri_t ota_post = { .uri = "/ota", .method = HTTP_POST, .handler = ota_handler, .user_ctx = NULL };
+            reg_err = httpd_register_uri_handler(hd, &ota_post);
+        }
+        if (reg_err == ESP_OK) {
+            ESP_LOGI(TAG, "OTA: http://<ip>/ota");
+        } else {
+            ESP_LOGE(TAG, "OTA: register /ota FAILED: %s", esp_err_to_name(reg_err));
         }
     } else {
         ESP_LOGE(TAG, "MJPEG: http_server_get_handle returned NULL, cannot register /mjpeg");

@@ -351,6 +351,15 @@ static void espnow_init(void)
     esp_now_init();                                // 启动 ESP-NOW 协议栈
     esp_now_register_recv_cb(espnow_recv_cb);      // 注册接收回调
     esp_now_register_send_cb(espnow_send_cb);      // 注册发送完成回调
+
+    /* 添加广播 peer，支持 P4 一发多收 (1 次发送 → 所有设备同时收到) */
+    esp_now_peer_info_t bc = {0};
+    memset(bc.peer_addr, 0xFF, 6);
+    bc.channel = s_espnow_channel;
+    bc.ifidx   = WIFI_IF_STA;
+    bc.encrypt = false;
+    esp_now_add_peer(&bc);
+
     ESP_LOGI(TAG, "ESP-NOW init OK");
 }
 

@@ -1,11 +1,15 @@
 idf_component_register(
     SRCS
         "main.c"
+        "face_detect.cpp"
     REQUIRES
+        app_update
         cmd_espnow
         cmd_wifi
         espnow_bridge
         sensor_imu
         cap_lua
-        esp_new_jpeg
+        esp_driver_jpeg
+        human_face_detect
+        esp_https_ota
 )

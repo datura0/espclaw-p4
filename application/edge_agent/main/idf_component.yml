@@ -1,6 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  espressif/esp_new_jpeg: "*"
+  espressif/human_face_detect: "*"
   espressif/esp_board_manager:
     version: "^0.5.10"
     public: true
